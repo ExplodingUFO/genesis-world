@@ -1,3 +1,4 @@
+import dataclasses
 import enum
 import functools
 import inspect
@@ -159,70 +160,73 @@ class Solver(RBC):
         tensor = qd_to_torch(self._gravity, envs_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
-    def dump_ckpt_to_numpy(self) -> dict[str, np.ndarray]:
-        arrays: dict[str, np.ndarray] = {}
-
-        for attr_name, value in self.__dict__.items():
-            if not isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
-                continue
-
-            key_base = ".".join((self.__class__.__name__, attr_name))
-            data = value.to_numpy()
-
-            # StructField -> data is a dict: flatten each member
-            if isinstance(data, dict):
-                for sub_name, sub_arr in data.items():
-                    arrays[f"{key_base}.{sub_name}"] = sub_arr
-            else:
-                arrays[key_base] = data
-
+    def _checkpoint_roots(self):
+        for name, value in self.__dict__.items():
+            if isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
+                yield name, value
         if self.data_manager is not None:
-            for attr_name, struct in self.data_manager.__dict__.items():
-                for sub_name in dir(struct):
-                    sub_arr = getattr(struct, sub_name)
-                    if isinstance(sub_arr, (qd.Tensor, qd.Field, qd.Ndarray)):
-                        store_name = f"{self.__class__.__name__}.data_manager.{attr_name}.{sub_name}"
-                        arrays[store_name] = sub_arr.to_numpy()
+            yield "data_manager", self.data_manager
 
+    def _checkpoint_fields(self):
+        # Only traverse declared solver-owned roots, never their scene/simulator backlinks.
+        seen = {id(self), id(self._scene), id(self._sim)}
+
+        def visit(name, value):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
+                yield name, value
+            elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+                for member in dataclasses.fields(value):
+                    yield from visit(f"{name}.{member.name}", getattr(value, member.name))
+            elif not callable(value) and not inspect.ismodule(value) and hasattr(value, "__dict__"):
+                for member, child in vars(value).items():
+                    yield from visit(f"{name}.{member}", child)
+
+        for name, value in self._checkpoint_roots():
+            yield from visit(f"{self.__class__.__name__}.{name}", value)
+
+    def dump_ckpt_to_numpy(self) -> dict[str, np.ndarray]:
+        """Capture owned native fields, including nested solver state, without alias copies."""
+        arrays: dict[str, np.ndarray] = {}
+        for name, field in self._checkpoint_fields():
+            data = field.to_numpy()
+            if isinstance(data, dict):
+                arrays.update((f"{name}.{member}", array) for member, array in data.items())
+            else:
+                arrays[name] = data
         return arrays
 
+    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
     def load_ckpt_from_numpy(self, arr_dict: dict[str, np.ndarray]) -> None:
-        for attr_name, value in self.__dict__.items():
-            if not isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
-                continue
-
-            key_base = ".".join((self.__class__.__name__, attr_name))
-            member_prefix = key_base + "."
-
-            # ---- StructField: gather its members -----------------------------
-            member_items = {}
-            for saved_key, saved_arr in arr_dict.items():
-                if saved_key.startswith(member_prefix):
-                    sub_name = saved_key[len(member_prefix) :]
-                    member_items[sub_name] = saved_arr
-
-            if member_items:  # we found at least one sub-member
-                value.from_numpy(member_items)
-                continue
-
-            # ---- Ordinary field ---------------------------------------------
-            if key_base not in arr_dict:
-                continue  # nothing saved for this attribute
-
-            arr = arr_dict[key_base]
-            value.from_numpy(arr)
-
-        # if it has data_manager, add it to the arrays
-        if self.data_manager is not None:
-            for attr_name, struct in self.data_manager.__dict__.items():
-                for sub_name in dir(struct):
-                    sub_arr = getattr(struct, sub_name)
-                    if isinstance(sub_arr, (qd.Tensor, qd.Field, qd.Ndarray)):
-                        store_name = f"{self.__class__.__name__}.data_manager.{attr_name}.{sub_name}"
-                        if store_name in arr_dict:
-                            sub_arr.from_numpy(arr_dict[store_name])
-                        else:
-                            gs.logger.warning(f"Failed to load {store_name}. Not found in stored arrays.")
+        """Reject an incomplete or incompatible field set before changing any native field."""
+        prepared = []
+        expected_keys = set()
+        for name, field in self._checkpoint_fields():
+            current = field.to_numpy()
+            members = current if isinstance(current, dict) else {None: current}
+            restored = {}
+            for member, target in members.items():
+                key = name if member is None else f"{name}.{member}"
+                expected_keys.add(key)
+                source = arr_dict.get(key)
+                if (
+                    not isinstance(source, np.ndarray)
+                    or source.shape != target.shape
+                    or source.dtype != target.dtype
+                ):
+                    raise ValueError(f"Checkpoint field is missing or incompatible: {key}")
+                restored[member] = source
+            prepared.append((field, restored if isinstance(current, dict) else restored[None]))
+        prefix = f"{self.__class__.__name__}."
+        actual_keys = {key for key in arr_dict if key.startswith(prefix)}
+        if actual_keys != expected_keys:
+            raise ValueError("Checkpoint contains fields outside the current solver layout")
+        for field, data in prepared:
+            field.from_numpy(data)
+        self._queried_states.clear()
+        self._sim._queried_states.clear()
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------

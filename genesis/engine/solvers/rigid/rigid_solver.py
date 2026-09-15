@@ -1996,6 +1996,11 @@ class RigidSolver(KinematicSolver):
         for entity in self._entities:
             entity.process_input_grad()
 
+    def _checkpoint_roots(self):
+        yield from super()._checkpoint_roots()
+        yield "collider", self.collider
+        yield "constraint_solver", self.constraint_solver
+
     def save_ckpt(self, ckpt_name):
         # Save ckpt only if we need gradients, because this operation is costly
         if self._requires_grad:
