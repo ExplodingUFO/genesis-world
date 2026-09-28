@@ -191,6 +191,8 @@ def _func_decomp_linesearch_p0(
 
             # All threads read the reduced snorm
             snorm = qd.sqrt(sh_snorm_sq[0])
+            # Finish every lane's read before Phase 2 reuses sh_snorm_sq.
+            qd.simt.block.sync()
 
             if snorm < rigid_global_info.EPS[None]:
                 # Converged — only thread 0 writes
