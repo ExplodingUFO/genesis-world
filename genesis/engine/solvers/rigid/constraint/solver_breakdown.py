@@ -941,22 +941,19 @@ def _func_check_early_exit(
     constraint_state: array_class.ConstraintState,
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
-    """Decrement iteration counter and exit early if no batch element improved."""
-    qd.loop_config(name="check_early_exit_reset_flag")
-    for _ in range(1):
-        graph_counter[()] = graph_counter[()] - 1
-        constraint_state.early_exit_flag[()] = 0
-
+    """Update the iteration budget and convergence decision in one GPU thread."""
     _B = constraint_state.grad.shape[1]
-    qd.loop_config(name="check_early_exit_scan_values")
-    for i_b in range(_B):
-        if constraint_state.improved[i_b]:
-            qd.atomic_max(constraint_state.early_exit_flag[()], 1)
-
-    qd.loop_config(name="check_early_exit_set_counter")
+    qd.loop_config(name="check_early_exit")
     for _ in range(1):
-        if constraint_state.early_exit_flag[()] == 0:
-            graph_counter[()] = 0
+        remaining = graph_counter[()] - 1
+        any_improved = False
+        for i_b in range(_B):
+            if constraint_state.improved[i_b]:
+                any_improved = True
+                break
+        if not any_improved:
+            remaining = 0
+        graph_counter[()] = remaining
 
 
 # ============================================== Solve body dispatch ================================================

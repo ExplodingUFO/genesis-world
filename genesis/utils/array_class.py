@@ -348,7 +348,6 @@ class ConstraintState:
     solver_iter_counter: qd.Tensor
     # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
     graph_counter: qd.types.ndarray()
-    early_exit_flag: qd.Tensor
 
 
 def get_constraint_state(constraint_solver, solver):
@@ -494,7 +493,6 @@ def get_constraint_state(constraint_solver, solver):
         use_full_hessian=V(dtype=qd.i32, shape=(_B,)),
         solver_iter_counter=V(dtype=qd.i32, shape=()),
         graph_counter=qd.ndarray(qd.i32, shape=()),
-        early_exit_flag=V(dtype=qd.i32, shape=()),
     )
 
 
